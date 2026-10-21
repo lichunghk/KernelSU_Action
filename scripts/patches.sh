@@ -81,10 +81,15 @@ susfs_apply() {
 	[ -n "$kernel_patch" ] && [ -f "$kernel_patch" ] \
 		|| die "no 50_add_susfs_in_*.patch found in ${kp}"
 
-	( cd "$KERNEL_DIR" && apply_patch "$kernel_patch" 1 ) \
-		|| die "the SUSFS kernel patch did not apply cleanly.
+	# apply_patch() only ever dry-runs until the whole patch is known to
+	# apply, so when it fails the tree is still untouched and the compat
+	# fallback starts from a clean slate.
+	if ! ( cd "$KERNEL_DIR" && apply_patch "$kernel_patch" 1 ); then
+		susfs_los49_fallback "$kernel_patch" \
+			|| die "the SUSFS kernel patch did not apply cleanly.
        This usually means SUSFS_BRANCH does not match your kernel. Detected
        kernel ${kver}, used branch '${branch}'."
+	fi
 
 	# 3. Patch the KernelSU side -- but only when the variant does not already
 	#    ship SUSFS support. SukiSU-Ultra's 'builtin' branch, for instance,
@@ -118,6 +123,52 @@ susfs_apply() {
 	ok "SUSFS ${sv:-?} applied from branch ${branch}"
 	summary "| SUSFS | \`${sv:-unknown}\` (branch \`${branch}\`) |"
 	endgroup
+}
+
+# LineageOS's 4.9.337 tree has diverged from the base susfs4ksu's kernel-4.9
+# patch (v1.5.5) was generated against, in exactly three files:
+#   fs/proc/task_mmu.c  -- an extra #include <linux/ctype.h> breaks the
+#                          context of the susfs_def.h include hunk;
+#   fs/proc/cmdline.c   -- LOS carries the INITRAMFS_IGNORE_SKIP_FLAG variant
+#                          of the file (different cmdline_proc_show body);
+#   fs/notify/fdinfo.c  -- LOS backported the newer inotify_fdinfo() (user-mask
+#                          helper, literal ignored_mask:0, no local mask var).
+# Every other hunk applies cleanly (verified hunk by hunk against the real
+# lineage-22.2 tree, including kernel/kallsyms.c and kernel/sys.c, and with
+# path_umount + manual hooks already applied, i.e. in build order).
+#
+# The fallback therefore: applies the upstream patch tolerantly, insists the
+# reject set is EXACTLY those three files (any other reject still fails the
+# build), applies patches/susfs-los49-compat.patch -- the three hunks
+# re-expressed against the LOS code -- and verifies the SUSFS markers landed.
+# Called from susfs_apply(), whose local $branch is in scope here.
+susfs_los49_fallback() {
+	local kernel_patch=$1
+	[ "${branch:-}" = "kernel-4.9" ] || return 1
+	local compat="${REPO_ROOT}/patches/susfs-los49-compat.patch"
+	[ -f "$compat" ] || {
+		warn "SUSFS: ${compat} missing; cannot run the LineageOS 4.9 compat fallback"
+		return 1
+	}
+
+	warn "SUSFS: upstream patch rejected; trying the LineageOS 4.9 compat fallback"
+	( cd "$KERNEL_DIR" && patch -p1 --force --no-backup-if-mismatch <"$kernel_patch" >/dev/null 2>&1 ) || true
+
+	local rej expected
+	rej=$( cd "$KERNEL_DIR" && find . -name '*.rej' -printf '%P\n' | sed 's/\.rej$//' | sort )
+	expected=$(printf '%s\n' fs/notify/fdinfo.c fs/proc/cmdline.c fs/proc/task_mmu.c | sort)
+	[ "$rej" = "$expected" ] || {
+		warn "SUSFS: unexpected reject set (expected exactly the 3 known LineageOS files):"
+		warn "${rej:-<none>}"
+		return 1
+	}
+
+	( cd "$KERNEL_DIR" && apply_patch "$compat" 1 ) || return 1
+	( cd "$KERNEL_DIR" && find . -name '*.rej' -delete )
+	grep -qs "susfs_spoof_cmdline_or_bootconfig" "${KERNEL_DIR}/fs/proc/cmdline.c" || return 1
+	grep -qs "#include <linux/susfs_def.h>" "${KERNEL_DIR}/fs/proc/task_mmu.c" || return 1
+	grep -qs "TASK_STRUCT_NON_ROOT_USER_APP_PROC" "${KERNEL_DIR}/fs/notify/fdinfo.c" || return 1
+	ok "SUSFS applied with the LineageOS 4.9 compat fallback (3 files adapted)"
 }
 
 # Does the selected variant+ref already contain SUSFS?
