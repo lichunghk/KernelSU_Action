@@ -44,6 +44,16 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# BBG and Re:Kernel are independent of the KernelSU variant. Their Kconfig
+	# entries only exist once patches.sh has integrated the sources, and an
+	# unknown symbol in a defconfig is silently dropped, so these lines must
+	# stay behind the same switches that gate the patch steps.
+	is_true "${ENABLE_BBG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_BBG
+	if is_true "${ENABLE_REKERNEL:-false}"; then
+		kconf_enable "$DEFCONFIG_PATH" CONFIG_REKERNEL
+		kconf_disable "$DEFCONFIG_PATH" CONFIG_REKERNEL_NETWORK
+	fi
+
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
