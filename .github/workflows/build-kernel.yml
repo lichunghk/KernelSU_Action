@@ -63,6 +63,18 @@ on:
         default: "config"
         type: choice
         options: [config, "true", "false"]
+      bbg:
+        description: "Apply Baseband Guard (partition write-protection LSM)"
+        required: false
+        default: "config"
+        type: choice
+        options: [config, "true", "false"]
+      rekernel:
+        description: "Apply Re:Kernel (binder/signal reporting for freezer apps)"
+        required: false
+        default: "config"
+        type: choice
+        options: [config, "true", "false"]
       extra_defconfig:
         description: "Extra defconfig lines, space separated (e.g. CONFIG_TMPFS_XATTR=y)"
         required: false
@@ -84,6 +96,8 @@ on:
       path_umount:     { required: false, default: "config",     type: string }
       hide_stuff:      { required: false, default: "config",     type: string }
       kpm:             { required: false, default: "config",     type: string }
+      bbg:             { required: false, default: "config",     type: string }
+      rekernel:        { required: false, default: "config",     type: string }
       extra_defconfig: { required: false, default: "",           type: string }
       publish_release: { required: false, default: false,        type: boolean }
 
@@ -122,6 +136,8 @@ jobs:
       IN_ENABLE_PATH_UMOUNT: ${{ inputs.path_umount }}
       IN_ENABLE_HIDE_STUFF: ${{ inputs.hide_stuff }}
       IN_ENABLE_KPM: ${{ inputs.kpm }}
+      IN_ENABLE_BBG: ${{ inputs.bbg }}
+      IN_ENABLE_REKERNEL: ${{ inputs.rekernel }}
       IN_EXTRA_DEFCONFIG: ${{ inputs.extra_defconfig }}
 
     steps:
