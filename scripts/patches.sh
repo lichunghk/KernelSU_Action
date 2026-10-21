@@ -556,6 +556,32 @@ PYEOF
 		info "JOBCTL_TRAP_FREEZE is not defined in this tree; jobctl_frozen() degraded to cgroup_freezing() only"
 	fi
 
+	# Adaptation 3: the inserted binder code tests TF_UPDATE_TXN, a binder
+	# transaction flag added to the uapi in later kernels (= 0x40, the bit
+	# after TF_CLEAR_BUF). This tree's binder predates it, so the flag is
+	# undeclared and binder.c does not compile (binder_can_update_transaction
+	# and the freeze check in binder_proc_transaction). No transaction on
+	# this kernel can ever carry the flag, so define it in rekernel.h with
+	# its upstream value: the checks compile and simply never trigger.
+	if grep -q 'TF_UPDATE_TXN' "$binder" \
+		&& ! grep -rqs 'TF_UPDATE_TXN' "${KERNEL_DIR}/include/uapi/linux/android/binder.h" "${KERNEL_DIR}/drivers/android/"*.h; then
+		python3 - "${KERNEL_DIR}/drivers/rekernel/rekernel.h" <<'PYEOF' \
+			|| die "Re:Kernel: failed to add the TF_UPDATE_TXN fallback define to rekernel.h"
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = "#include <uapi/linux/android/binder.h>\n"
+define = (anchor +
+          "\n#ifndef TF_UPDATE_TXN\n"
+          "#define TF_UPDATE_TXN 0x40\n"
+          "#endif\n")
+assert anchor in s, "uapi binder include not found in rekernel.h"
+assert "#define TF_UPDATE_TXN" not in s
+open(p, "w").write(s.replace(anchor, define, 1))
+PYEOF
+		info "TF_UPDATE_TXN is not defined in this tree; rekernel.h now defines it as 0x40 (its upstream value)"
+	fi
+
 	# Verify every piece landed; upstream's script only echoes on failure.
 	[ -f "${KERNEL_DIR}/drivers/rekernel/rekernel.c" ] \
 		|| die "Re:Kernel integration failed: drivers/rekernel was not created"
@@ -569,6 +595,11 @@ PYEOF
 		|| die "Re:Kernel integration failed: the binder transaction hook did not land in binder.c"
 	grep -q 'rekernel_report(SIGNAL' "$signal" \
 		|| die "Re:Kernel integration failed: the signal hook did not land in kernel/signal.c"
+	if grep -q 'TF_UPDATE_TXN' "$binder"; then
+		grep -qs '#define TF_UPDATE_TXN' "${KERNEL_DIR}/drivers/rekernel/rekernel.h" \
+			|| grep -rqs 'TF_UPDATE_TXN' "${KERNEL_DIR}/include/uapi/linux/android/binder.h" "${KERNEL_DIR}/drivers/android/"*.h \
+			|| die "Re:Kernel integration failed: TF_UPDATE_TXN is used in binder.c but defined nowhere"
+	fi
 
 	export_env REKERNEL_APPLIED true
 	ok "Re:Kernel integrated"
