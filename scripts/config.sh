@@ -64,6 +64,10 @@ declare -A DEFAULTS=(
 	[ENABLE_PATH_UMOUNT]="false"
 	[ENABLE_HIDE_STUFF]="false"
 	[ENABLE_KPM]="false"
+	[ENABLE_BBG]="false"
+	[BBG_REPO]="https://github.com/vc-teahouse/Baseband-guard"
+	[ENABLE_REKERNEL]="false"
+	[REKERNEL_REPO]="https://github.com/Sakion-Team/Re-Kernel"
 
 	# Kconfig tweaks
 	[ADD_KPROBES_CONFIG]="false"
