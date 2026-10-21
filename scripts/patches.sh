@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Kernel source patching: SUSFS, path_umount backport, hide_stuff, manual hooks.
+# Kernel source patching: SUSFS, path_umount backport, hide_stuff, manual hooks,
+# Baseband Guard (BBG) and Re:Kernel.
 #
 # Everything here is idempotent and version-aware. Each step is skipped with a
 # clear message when it is unnecessary (feature already present) rather than
@@ -361,6 +362,169 @@ kpm_patch_image() {
 	endgroup
 }
 
+# ====================================================================== BBG
+
+# Baseband Guard (vc-teahouse/Baseband-guard) is an LSM that blocks writes to
+# protected block devices (boot, baseband/modem and other function partitions)
+# from non-allowlisted SELinux domains. Integration is delegated to upstream's
+# own setup.sh, which is idempotent: it clones the repo into
+# <kernel>/Baseband-guard, symlinks security/baseband-guard at it, adds the
+# security/Makefile and security/Kconfig entries, and on pre-5.1 trees (no
+# DEFINE_LSM in include/linux/lsm_hooks.h) applies its SELinux patch
+# (sepatch.txt appended to security/selinux/Makefile, plus objsec.h hooks).
+# CONFIG_BBG itself is enabled in build.sh's prepare_defconfig; on pre-5.1
+# kernels there is no CONFIG_LSM list to extend, BBG registers through the
+# legacy LSM hook table.
+bbg_apply() {
+	local repo=${BBG_REPO:-https://github.com/vc-teahouse/Baseband-guard}
+	group "Applying Baseband Guard (BBG)"
+
+	[ -d "${KERNEL_DIR}/security" ] \
+		|| die "security/ not found in the kernel tree; BBG needs the LSM subsystem"
+	[ -f "${KERNEL_DIR}/include/linux/lsm_hooks.h" ] \
+		|| die "include/linux/lsm_hooks.h not found; upstream BBG setup.sh requires it"
+
+	if [ -f "${KERNEL_DIR}/security/baseband-guard/baseband_guard.c" ]; then
+		info "Baseband Guard is already integrated; nothing to do"
+		endgroup; return 0
+	fi
+
+	local src="${WORKSPACE}/Baseband-guard-src"
+	rm -rf "$src"
+	retry 3 git clone -q --depth=1 "$repo" "$src" \
+		|| die "failed to clone ${repo}"
+	[ -f "${src}/setup.sh" ] || die "unexpected Baseband-guard layout: setup.sh missing"
+
+	# setup.sh clones the payload repo itself (hardcoded upstream URL); point
+	# that at BBG_REPO when it was overridden.
+	if [ "$repo" != "https://github.com/vc-teahouse/Baseband-guard" ]; then
+		sed -i "s|BBG_REPO=\"[^\"]*\"|BBG_REPO=\"${repo}\"|" "${src}/setup.sh"
+	fi
+
+	( cd "$KERNEL_DIR" && bash "${src}/setup.sh" ) \
+		|| die "Baseband-guard setup.sh failed"
+
+	# setup.sh reports some failures only in its output; verify the tree.
+	grep -q 'baseband-guard/' "${KERNEL_DIR}/security/Makefile" \
+		|| die "BBG integration failed: security/Makefile was not updated"
+	grep -q 'security/baseband-guard/Kconfig' "${KERNEL_DIR}/security/Kconfig" \
+		|| die "BBG integration failed: security/Kconfig was not updated"
+	[ -f "${KERNEL_DIR}/security/baseband-guard/baseband_guard.c" ] \
+		|| die "BBG integration failed: security/baseband-guard is not linked into the tree"
+
+	export_env BBG_APPLIED true
+	ok "Baseband Guard integrated"
+	summary "| BBG | applied |"
+	endgroup
+}
+
+# ================================================================= Re:Kernel
+
+# Re:Kernel (Sakion-Team/Re-Kernel) reports binder transactions and signals
+# aimed at frozen apps over a dedicated netlink unit, for freezer/tombstone
+# apps (Hail, Thanox, IceBox, ...). The source integration is upstream's own
+# Integrate/patches.sh (drop-in drivers/rekernel + sed hooks into
+# drivers/android/binder.c and kernel/signal.c), run verbatim, with two
+# adaptations for older Android trees that upstream's script misses, plus
+# hard verification: a half-integrated Re:Kernel compiles fine but never
+# reports a binder event, so every hook is checked before continuing.
+rekernel_apply() {
+	local repo=${REKERNEL_REPO:-https://github.com/Sakion-Team/Re-Kernel}
+	local binder="${KERNEL_DIR}/drivers/android/binder.c"
+	local signal="${KERNEL_DIR}/kernel/signal.c"
+	group "Applying Re:Kernel"
+
+	[ -f "$binder" ] || die "drivers/android/binder.c not found"
+	[ -f "$signal" ] || die "kernel/signal.c not found"
+
+	if grep -q 'rekernel_binder_transaction' "$binder"; then
+		info "Re:Kernel is already integrated; nothing to do"
+		endgroup; return 0
+	fi
+
+	# The binder hooks anchor on the backported (binder_proc_transaction-era)
+	# binder. Fail here, with the reason, instead of letting upstream's script
+	# print an "Error:" line and carry on without the binder integration.
+	local anchor
+	for anchor in \
+		'binder_proc_transaction() - sends a transaction to a process and wakes it up' \
+		'binder_enqueue_work_ilocked(&t->work, &proc->todo)' \
+		'trace_binder_transaction(reply, t, target_node);' \
+		'bool pending_async = false;'; do
+		grep -qF "$anchor" "$binder" \
+			|| die "Re:Kernel cannot integrate: anchor '${anchor}' not found in drivers/android/binder.c.
+       This tree's binder predates the binder_proc_transaction refactor that
+       upstream Re:Kernel hooks into; integrate it manually instead."
+	done
+
+	local src="${WORKSPACE}/Re-Kernel"
+	rm -rf "$src"
+	retry 3 git clone -q --depth=1 "$repo" "$src" \
+		|| die "failed to clone ${repo}"
+	local integ="${src}/Integrate"
+	[ -f "${integ}/rekernel/rekernel.c" ] && [ -f "${integ}/patches.sh" ] \
+		|| die "unexpected Re-Kernel layout: Integrate/ missing"
+
+	( cd "$KERNEL_DIR" && bash "${integ}/patches.sh" ) \
+		|| warn "upstream Re:Kernel patches.sh exited non-zero; verifying the tree before continuing"
+
+	# Adaptation 1: upstream inserts the rekernel.h include before
+	# '#include <uapi/linux/android/binder.h>' in binder.c. Trees whose binder
+	# predates that include line (e.g. the LOS sdm845 4.9 binder) never get the
+	# include, and the inserted hook code then references undeclared handlers.
+	if ! grep -q '#include <../rekernel/rekernel.h>' "$binder"; then
+		grep -q '#include "binder_alloc.h"' "$binder" \
+			|| die "Re:Kernel: no binder.c include anchor found (neither the uapi binder header nor binder_alloc.h)"
+		sed -i '/#include "binder_alloc.h"/a\
+#ifdef CONFIG_REKERNEL\
+#include <../rekernel/rekernel.h>\
+#endif /* CONFIG_REKERNEL */' "$binder"
+		info "rekernel.h include anchored on binder_alloc.h (this binder has no uapi binder include)"
+	fi
+
+	# Adaptation 2: rekernel.h dereferences JOBCTL_TRAP_FREEZE unconditionally.
+	# That flag only exists on trees carrying the cgroup freezer v2 backport;
+	# on plain pre-5.x trees (e.g. LOS sdm845 4.9) it is undefined and the
+	# driver does not compile. Degrade jobctl_frozen() to the cgroup freezer
+	# check alone there, which is the freeze signal those trees actually use.
+	if ! grep -rq 'JOBCTL_TRAP_FREEZE' "${KERNEL_DIR}/include/"; then
+		python3 - "${KERNEL_DIR}/drivers/rekernel/rekernel.h" <<'PYEOF' \
+			|| die "Re:Kernel: failed to patch rekernel.h for missing JOBCTL_TRAP_FREEZE"
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "\treturn ((task->jobctl & JOBCTL_TRAP_FREEZE) != 0);"
+new = ("#ifdef JOBCTL_TRAP_FREEZE\n"
+       "\treturn ((task->jobctl & JOBCTL_TRAP_FREEZE) != 0);\n"
+       "#else\n"
+       "\treturn false;\n"
+       "#endif")
+assert old in s, "jobctl_frozen() body not found in rekernel.h"
+open(p, "w").write(s.replace(old, new, 1))
+PYEOF
+		info "JOBCTL_TRAP_FREEZE is not defined in this tree; jobctl_frozen() degraded to cgroup_freezing() only"
+	fi
+
+	# Verify every piece landed; upstream's script only echoes on failure.
+	[ -f "${KERNEL_DIR}/drivers/rekernel/rekernel.c" ] \
+		|| die "Re:Kernel integration failed: drivers/rekernel was not created"
+	grep -q 'drivers/rekernel/Kconfig' "${KERNEL_DIR}/drivers/Kconfig" \
+		|| die "Re:Kernel integration failed: drivers/Kconfig was not updated"
+	grep -q 'rekernel/' "${KERNEL_DIR}/drivers/Makefile" \
+		|| die "Re:Kernel integration failed: drivers/Makefile was not updated"
+	grep -q '#include <../rekernel/rekernel.h>' "$binder" \
+		|| die "Re:Kernel integration failed: binder.c is missing the rekernel.h include"
+	grep -q 'rekernel_binder_transaction(reply, t, target_node, tr);' "$binder" \
+		|| die "Re:Kernel integration failed: the binder transaction hook did not land in binder.c"
+	grep -q 'rekernel_report(SIGNAL' "$signal" \
+		|| die "Re:Kernel integration failed: the signal hook did not land in kernel/signal.c"
+
+	export_env REKERNEL_APPLIED true
+	ok "Re:Kernel integrated"
+	summary "| Re:Kernel | applied |"
+	endgroup
+}
+
 # --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -369,6 +533,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		path_umount)  path_umount_apply ;;
 		hide_stuff)   hide_stuff_apply ;;
 		hooks)        hooks_patch_apply ;;
+		bbg)          bbg_apply ;;
+		rekernel)     rekernel_apply ;;
 		kpm)          kpm_patch_image "$2" ;;
 		all)
 			# Order matters and this is the tested one (4.19 + SukiSU builtin
@@ -386,6 +552,12 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 			fi
 
 			if is_true "${ENABLE_SUSFS:-false}";      then susfs_apply;      fi
+
+			# BBG and Re:Kernel touch disjoint files (security/, drivers/,
+			# kernel/signal.c) from everything above, so they run after
+			# SUSFS, in either order relative to each other.
+			if is_true "${ENABLE_BBG:-false}";       then bbg_apply;       fi
+			if is_true "${ENABLE_REKERNEL:-false}";  then rekernel_apply;  fi
 			if is_true "${ENABLE_HIDE_STUFF:-false}"; then hide_stuff_apply; fi
 			;;
 		*) die "unknown patch step '$1'" ;;
